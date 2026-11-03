@@ -16,14 +16,18 @@ import zlib
 from pathlib import Path
 from typing import Any, Iterable
 
+from .bucket_archive import assert_not_archive_path, resolve_read
+
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    assert_not_archive_path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     text = _canonical_json(payload, pretty=True)
     _atomic_write_text(path, text)
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
+    assert_not_archive_path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     current = path.read_text(encoding="utf-8") if path.exists() else None
     if current == text:
@@ -40,6 +44,7 @@ def _atomic_write_text(path: Path, text: str) -> None:
 
 
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    assert_not_archive_path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists() and path.read_bytes() == data:
         return
@@ -108,6 +113,7 @@ def _write_streaming_gzip(path: Path, lines: Iterable[str]) -> bool:
     OUTPUT size, not the uncompressed input) so this compares actual bytes,
     never a size or hash proxy.
     """
+    assert_not_archive_path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     compressor = zlib.compressobj(6, zlib.DEFLATED, 31)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
@@ -133,7 +139,7 @@ def _write_streaming_gzip(path: Path, lines: Iterable[str]) -> bool:
 
 
 def _read_gzip_bytes(path: Path) -> bytes:
-    return gzip.decompress(path.read_bytes())
+    return gzip.decompress(resolve_read(path).read_bytes())
 
 
 def _digest_payload(payload: Any) -> str:
