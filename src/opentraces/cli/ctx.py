@@ -1195,9 +1195,11 @@ def _manifest_slug_for_trace(trace_id: str) -> str | None:
 def _read_bucket_nodes(slug: str, trace_id: str) -> list[Any]:
     """Read a trace's ContextNodes from the bucket companion (nodes.jsonl)."""
     from ..core.bucket_layout import context_tree_nodes_path
+    from ..core.bucket_archive import resolve_read
+    from ..core.bucket_archive import resolve_read
     from ..core.context_tree.models import ContextNode
 
-    path = context_tree_nodes_path(slug, trace_id)
+    path = resolve_read(context_tree_nodes_path(slug, trace_id))
     if not path.exists():
         return []
     out: list[Any] = []

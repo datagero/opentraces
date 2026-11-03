@@ -35,6 +35,12 @@ from typing import Any, Iterator
 
 from opentraces.core._time import utc_now_str
 
+from .bucket_archive import (
+    exists_with_archive,
+    glob_with_archive,
+    resolve_read,
+    skip_if_archived,
+)
 from .bucket_layout import (
     _path_part,
     blobs_v1_root,
@@ -255,6 +261,8 @@ def project_context_tree_to_bucket(
     heads_unchanged = 0
 
     for tid in target_trace_ids:
+        if skip_if_archived(project_slug, tid):
+            continue
         node_ids = list(projection.nodes_by_trace.get(tid, []))
         nodes = [projection.nodes_by_id[nid] for nid in node_ids if nid in projection.nodes_by_id]
         if not nodes:
@@ -393,7 +401,7 @@ def project_context_tree_to_bucket(
 def read_context_tree_head(project_slug: str, trace_id: str) -> dict[str, Any] | None:
     """Return the per-trace head envelope (raw dict), or None if missing."""
 
-    path = context_tree_head_path(project_slug, trace_id)
+    path = resolve_read(context_tree_head_path(project_slug, trace_id))
     if not path.exists():
         return None
     try:
@@ -420,12 +428,10 @@ def _iter_context_tree_head_payloads(
 
     root = contexts_root()
     out: list[tuple[str, str, dict[str, Any]]] = []
-    if not root.exists():
-        return out
     project_pattern = _path_part(project_slug) if project_slug else "*"
-    for head_path in sorted(root.glob(f"{project_pattern}/*/head.json")):
+    for head_path in glob_with_archive(root, f"{project_pattern}/*/head.json"):
         try:
-            payload = json.loads(head_path.read_text(encoding="utf-8"))
+            payload = json.loads(resolve_read(head_path).read_text(encoding="utf-8"))
         except (OSError, ValueError, json.JSONDecodeError):
             continue
         if not isinstance(payload, dict):
@@ -703,7 +709,7 @@ def _layer_id_refs_for_trace(
     """
 
     ctx_path = trace_v1_context_path(project_slug, trace_id)
-    if not ctx_path.exists():
+    if not exists_with_archive(ctx_path):
         return set()
     try:
         raw = _read_gzip_bytes(ctx_path).decode("utf-8")

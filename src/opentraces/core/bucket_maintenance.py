@@ -22,6 +22,7 @@ from urllib.parse import unquote
 
 
 from . import paths
+from .bucket_archive import exists_with_archive, glob_with_archive
 from ._bucket_io import _atomic_write_bytes
 from .bucket_context_store import (
     _blob_content_matches_path,
@@ -522,38 +523,37 @@ def bucket_verify(
 
     # Walk per-trace context.jsonl.gz under traces/v1/, bounded to the sample.
     traces_root = traces_v1_root()
-    if traces_root.exists():
-        for trace_json in _bounded(sorted(traces_root.glob("*/*/trace.json"))):
-            try:
-                proj_slug = unquote(trace_json.parent.parent.name)
-                tid = unquote(trace_json.parent.name)
-            except Exception:
+    for trace_json in _bounded(glob_with_archive(traces_root, "*/*/trace.json")):
+        try:
+            proj_slug = unquote(trace_json.parent.parent.name)
+            tid = unquote(trace_json.parent.name)
+        except Exception:
+            continue
+        trace_refs = _layer_id_refs_for_trace(proj_slug, tid)
+        referenced_layer_ids.update(trace_refs)
+        # Per-trace dangling check: each referenced layer_id must have
+        # a blob on disk under the project's namespace (or _shared).
+        for layer_id in trace_refs:
+            proj_path = blobs_v1_context_path(proj_slug, layer_id)
+            shared_path = context_layer_blob_path(
+                proj_slug, layer_id, scope="global"
+            )
+            if proj_path.exists() or shared_path.exists():
                 continue
-            trace_refs = _layer_id_refs_for_trace(proj_slug, tid)
-            referenced_layer_ids.update(trace_refs)
-            # Per-trace dangling check: each referenced layer_id must have
-            # a blob on disk under the project's namespace (or _shared).
-            for layer_id in trace_refs:
-                proj_path = blobs_v1_context_path(proj_slug, layer_id)
-                shared_path = context_layer_blob_path(
-                    proj_slug, layer_id, scope="global"
-                )
-                if proj_path.exists() or shared_path.exists():
-                    continue
-                try:
-                    rel = proj_path.relative_to(paths.bucket_dir()).as_posix()
-                except ValueError:
-                    rel = str(proj_path)
-                errors.append(
-                    {
-                        "kind": "dangling_blob",
-                        "path": rel,
-                        "detail": (
-                            f"trace {tid!r} references layer_id "
-                            f"{layer_id!r} but no blob exists"
-                        ),
-                    }
-                )
+            try:
+                rel = proj_path.relative_to(paths.bucket_dir()).as_posix()
+            except ValueError:
+                rel = str(proj_path)
+            errors.append(
+                {
+                    "kind": "dangling_blob",
+                    "path": rel,
+                    "detail": (
+                        f"trace {tid!r} references layer_id "
+                        f"{layer_id!r} but no blob exists"
+                    ),
+                }
+            )
 
     # Events-mirror dangling check: walk every layer_id seen in mirror and
     # verify *some* project has a blob for it (we don't know the project
@@ -624,7 +624,7 @@ def bucket_verify(
                 if not isinstance(rel_trace_path, str) or not rel_trace_path:
                     continue
                 abs_path = paths.bucket_dir() / rel_trace_path
-                if abs_path.exists():
+                if exists_with_archive(abs_path):
                     continue
                 errors.append(
                     {
@@ -713,11 +713,10 @@ def bucket_prune(*, dry_run: bool = False, superseded_raw: bool = False) -> dict
             reachable.update(_layer_id_refs_for_trace(proj_slug, tid))
     else:
         traces_root = traces_v1_root()
-        if traces_root.exists():
-            for trace_json in sorted(traces_root.glob("*/*/trace.json")):
-                proj_slug = unquote(trace_json.parent.parent.name)
-                tid = unquote(trace_json.parent.name)
-                reachable.update(_layer_id_refs_for_trace(proj_slug, tid))
+        for trace_json in glob_with_archive(traces_root, "*/*/trace.json"):
+            proj_slug = unquote(trace_json.parent.parent.name)
+            tid = unquote(trace_json.parent.name)
+            reachable.update(_layer_id_refs_for_trace(proj_slug, tid))
 
     # --- 2a. Orphan blob sweep ------------------------------------------
     for blob_path in _iter_context_blob_files():

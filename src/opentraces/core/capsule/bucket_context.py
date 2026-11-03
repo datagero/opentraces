@@ -17,6 +17,7 @@ import gzip
 import json
 from typing import Any
 
+from ..bucket_archive import resolve_read
 from ..bucket_layout import (
     context_layer_blob_path,
     context_tree_head_path,
@@ -34,7 +35,7 @@ _LAYER_FIELDS = (
 
 
 def _read_nodes(slug: str, trace_id: str) -> list[dict[str, Any]]:
-    path = context_tree_nodes_path(slug, trace_id)
+    path = resolve_read(context_tree_nodes_path(slug, trace_id))
     if not path.exists():
         return []
     out: list[dict[str, Any]] = []
@@ -50,7 +51,7 @@ def _read_nodes(slug: str, trace_id: str) -> list[dict[str, Any]]:
 
 
 def _read_head(slug: str, trace_id: str) -> dict[str, Any]:
-    path = context_tree_head_path(slug, trace_id)
+    path = resolve_read(context_tree_head_path(slug, trace_id))
     if not path.exists():
         return {}
     try:
