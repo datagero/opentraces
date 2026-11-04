@@ -3743,6 +3743,23 @@ def _pi_bridge_cmd(
     click.echo(json.dumps(result.to_json(), sort_keys=True))
 
 
+def _hook_min_interval_s() -> float:
+    """Stop-hook re-capture throttle: env override, else config, else 0."""
+
+    import os
+
+    raw = os.environ.get("OPENTRACES_HOOK_MIN_INTERVAL_S")
+    if raw is not None:
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            return 0.0
+    try:
+        return float(load_config().capture.hook_min_interval_seconds)
+    except Exception:  # noqa: BLE001 — never break the hook over config
+        return 0.0
+
+
 @main.command("_ingest-session", hidden=True)
 @click.argument("transcript_path", type=click.Path())
 @click.option("--project", "project_override", type=click.Path(),
@@ -3806,6 +3823,7 @@ def _ingest_session(
             project_dir,
             wait_for_lock=False,
             parser_name=agent_name,
+            min_recapture_interval_s=_hook_min_interval_s(),
         )
     except Exception:  # noqa: BLE001
         # Belt: never let a hook break the user's agent session.

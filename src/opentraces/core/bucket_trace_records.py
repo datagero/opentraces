@@ -10,6 +10,7 @@ turning ``bucket_store`` back into the implementation hub.
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +39,8 @@ from .bucket_models import (
     TRACE_RECORD_BUCKET_SCHEMA,
     TRACE_RECORD_POINTER_SCHEMA,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def trace_record_path(
@@ -116,6 +119,7 @@ def write_trace_record(
             "updated_at": envelope["written_at"],
         },
     )
+    _pack_superseded_after_write(object_path.parent)
     try:
         from .trace_search_state import mark_search_snapshot_dirty
 
@@ -131,6 +135,23 @@ def write_trace_record(
         record=normalized,
         envelope=envelope,
     )
+
+
+def _pack_superseded_after_write(trace_dir: Path) -> None:
+    """Best effort: fold superseded versions into a pack segment (lossless).
+
+    The record write above is already durable; packing is an optimisation, so
+    no failure here (missing codec, disk full, a concurrent pack) may fail the
+    capture. ``bucket pack`` is the backstop for anything left loose.
+    """
+
+    try:
+        from .bucket_trace_pack import pack_on_write, pack_on_write_enabled
+
+        if pack_on_write_enabled():
+            pack_on_write(trace_dir)
+    except Exception:
+        logger.debug("pack-on-write skipped for %s", trace_dir, exc_info=True)
 
 
 def read_trace_record_object(path: Path) -> BucketTraceRecord | None:

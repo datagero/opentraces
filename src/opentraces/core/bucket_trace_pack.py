@@ -34,6 +34,17 @@ Safety:
   reader ignores and the next pack run removes once they are an hour old.
 - The current object and objects younger than ``min_age_seconds`` (default one
   hour) are never packed. ``current.json`` is re-read right before each unlink.
+
+Pack on write (``pack_on_write``): ``write_trace_record`` calls it after every
+repoint. Once a trace has ``PACK_ON_WRITE_MIN_LOOSE`` superseded loose objects
+(or ``PACK_ON_WRITE_MIN_BYTES`` of them), they go into a NEW small segment
+``superseded.<stamp>.otpack`` — the main pack is never rewritten on the capture
+path, so the cost is bounded by the segment, not by the trace's history.
+``bucket pack`` folds segments back into ``superseded.otpack``. Every reader
+treats the main pack and all segments as one member set. No lock is needed:
+writers only ever add new files, a segment or loose file is removed only after
+a verified pack holding its members is in place, and a member present in two
+packs is the same (name, sha256) version.
 """
 
 from __future__ import annotations
@@ -53,7 +64,7 @@ from pathlib import Path
 from typing import Any
 
 from . import paths
-from .bucket_archive import resolve_read
+from .bucket_archive import glob_with_archive, resolve_read
 from .bucket_layout import trace_records_root
 from .bucket_models import TRACE_RECORD_POINTER_SCHEMA
 from .bucket_pack_codecs import (
@@ -67,6 +78,11 @@ from .bucket_pack_codecs import (
 )
 
 PACK_NAME = "superseded.otpack"
+SEGMENT_GLOB = "superseded.*.otpack"
+_SEGMENT_NAME = re.compile(r"^superseded\.[0-9]{20}-[0-9a-f]{8}\.otpack$")
+PACK_ON_WRITE_MIN_LOOSE = 8
+PACK_ON_WRITE_MIN_BYTES = 256 * 1024 * 1024
+PACK_ON_WRITE_ENV = "OPENTRACES_PACK_ON_WRITE"
 DEFAULT_MIN_AGE_SECONDS = 60 * 60
 _TMP_PREFIX = f".{PACK_NAME}."
 _TMP_MAX_AGE_SECONDS = 60 * 60
@@ -105,6 +121,47 @@ class PackMember:
 
 def pack_path(trace_dir: Path) -> Path:
     return trace_dir / PACK_NAME
+
+
+def is_pack_name(file_name: str) -> bool:
+    return file_name == PACK_NAME or bool(_SEGMENT_NAME.match(file_name))
+
+
+def segment_paths(trace_dir: Path) -> list[Path]:
+    """Pack-on-write segments of one trace, oldest first (names sort by time)."""
+
+    if not trace_dir.is_dir():
+        return []
+    return sorted(p for p in trace_dir.glob(SEGMENT_GLOB) if _SEGMENT_NAME.match(p.name) and p.is_file())
+
+
+def trace_packs(trace_dir: Path) -> list[Path]:
+    """Main pack (if any) then every segment: together, the packed member set."""
+
+    main = pack_path(trace_dir)
+    return ([main] if main.is_file() else []) + segment_paths(trace_dir)
+
+
+def _new_segment_path(trace_dir: Path) -> Path:
+    return trace_dir / f"superseded.{time.time_ns():020d}-{os.urandom(4).hex()}.otpack"
+
+
+def _unique(members: Iterator[PackMember]) -> Iterator[PackMember]:
+    seen: set[tuple[str, str]] = set()
+    for member in members:
+        key = (member.name, member.sha256)
+        if key not in seen:
+            seen.add(key)
+            yield member
+
+
+def _iter_all_members(packs: list[Path]) -> Iterator[PackMember]:
+    """Members of several mtime-ordered packs, merged in mtime order, deduped."""
+
+    streams = [iter_pack_members(p) for p in packs]
+    if len(streams) == 1:
+        return _unique(streams[0])
+    return _unique(heapq.merge(*streams, key=lambda m: (m.mtime_ns, m.name)))
 
 
 def _sha256(data: bytes) -> str:
@@ -151,18 +208,23 @@ def list_pack(path: Path) -> set[tuple[str, str]]:
 def read_packed_object(object_path: Path) -> bytes | None:
     """Return the bytes of ``object_path`` from its trace's pack, if packed."""
 
-    pack = resolve_read(pack_path(object_path.parent))
-    if not pack.is_file():
-        return None
+    trace_dir = object_path.parent
+    candidates = [pack_path(trace_dir), *(
+        p for p in glob_with_archive(trace_dir, SEGMENT_GLOB) if _SEGMENT_NAME.match(p.name)
+    )]
     found: PackMember | None = None
-    try:
-        for member in iter_pack_members(pack):
-            if member.name == object_path.name and (found is None or member.mtime_ns >= found.mtime_ns):
-                found = member
-    except CodecUnavailable:
-        raise
-    except PACK_ERRORS:
-        return None
+    for candidate in candidates:
+        pack = resolve_read(candidate)
+        if not pack.is_file():
+            continue
+        try:
+            for member in iter_pack_members(pack):
+                if member.name == object_path.name and (found is None or member.mtime_ns >= found.mtime_ns):
+                    found = member
+        except CodecUnavailable:
+            raise
+        except PACK_ERRORS:
+            continue
     return found.data if found is not None else None
 
 
@@ -173,8 +235,7 @@ def iter_trace_record_versions(trace_dir: Path) -> Iterator[tuple[str, bytes, in
     """
 
     items: dict[tuple[str, str], tuple[bytes, int]] = {}
-    pack = pack_path(trace_dir)
-    if pack.is_file():
+    for pack in trace_packs(trace_dir):
         for member in iter_pack_members(pack):
             items[(member.name, member.sha256)] = (member.data, member.mtime_ns)
     for path in trace_dir.iterdir():
@@ -330,16 +391,32 @@ def pack_trace_dir(
             continue
         candidates.append(path)
         out["loose_bytes_packable"] += st.st_size
+    segments = segment_paths(trace_dir)
     out["records_packable"] = len(candidates)
+    out["segments_merged"] = 0
     if dry_run:
+        out["segments_mergeable"] = len(segments)
         return out
     out["tmp_removed"] = _sweep_stale_tmp(trace_dir, now)
-    if not candidates:
+    if not candidates and not segments:
         return out
 
     pack = pack_path(trace_dir)
-    existing = list_pack(pack) if pack.is_file() else set()
-    loose = [(path, _loose_member(path)) for path in candidates]
+    main_existing = list_pack(pack) if pack.is_file() else set()
+    segment_members: set[tuple[str, str]] = set()
+    segment_max = 0
+    for segment in segments:
+        for member in iter_pack_members(segment):
+            segment_members.add((member.name, member.sha256))
+            segment_max = max(segment_max, len(member.data))
+    existing = main_existing | segment_members
+    loose: list[tuple[Path, PackMember]] = []
+    for path in candidates:
+        try:
+            loose.append((path, _loose_member(path)))
+        except FileNotFoundError:
+            # Packed into a segment by a concurrent capture: nothing to do.
+            continue
     new: list[PackMember] = []
     queued: set[tuple[str, str]] = set()
     for _path, member in loose:
@@ -349,18 +426,22 @@ def pack_trace_dir(
         if key not in existing and key not in queued:
             new.append(member)
             queued.add(key)
-    if new:
+    if new or segments:
         new.sort(key=lambda m: (m.mtime_ns, m.name))
-        old_sizes = [len(m.data) for m in new]
-        stream: Iterator[PackMember] = iter(new)
-        if existing:
-            stream = heapq.merge(
-                iter_pack_members(pack), iter(new), key=lambda m: (m.mtime_ns, m.name)
-            )
+        sizes = [len(m.data) for m in new] + [segment_max]
+        # The packs listed above, not a fresh listing: a segment added by a
+        # concurrent capture now is not in ``existing`` and stays for next run.
+        listed = ([pack] if main_existing or pack.is_file() else []) + segments
+        stream: Iterator[PackMember] = _iter_all_members(listed) if listed else iter(())
+        if new:
+            stream = _unique(heapq.merge(stream, iter(new), key=lambda m: (m.mtime_ns, m.name)))
         written = _write_pack(
-            pack, stream, window_log(max(old_sizes)), expected=existing | queued
+            pack, stream, window_log(max(sizes)), expected=existing | queued
         )
         out["pack_written"] = True
+        for segment in segments:
+            segment.unlink(missing_ok=True)
+            out["segments_merged"] += 1
     else:
         written = existing
     for path, member in loose:
@@ -369,10 +450,78 @@ def pack_trace_dir(
         if path.name == member.name and _current_object_name(trace_dir) == member.name:
             # Repointed at this object while we were packing; keep it loose.
             continue
-        path.unlink()
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            continue
         out["records_packed"] += 1
     _fsync_dir(trace_dir)
-    out["pack_bytes"] = pack.stat().st_size
+    out["pack_bytes"] = pack.stat().st_size if pack.is_file() else 0
+    return out
+
+
+def pack_on_write_enabled() -> bool:
+    return os.environ.get(PACK_ON_WRITE_ENV, "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def pack_on_write(
+    trace_dir: Path,
+    *,
+    min_loose: int = PACK_ON_WRITE_MIN_LOOSE,
+    min_bytes: int = PACK_ON_WRITE_MIN_BYTES,
+) -> dict[str, Any]:
+    """Move the superseded loose objects of one trace into a NEW segment.
+
+    Called on the capture path right after ``current.json`` is repointed. Does
+    nothing until the trace has ``min_loose`` superseded objects or
+    ``min_bytes`` of them, so a trace costs at most that much loose history.
+    Never rewrites the main pack. Raises ``PACK_ERRORS`` (incl.
+    ``CodecUnavailable``); the caller decides whether to swallow them.
+    """
+
+    out: dict[str, Any] = {"records_packed": 0, "segment_written": False, "segment_bytes": 0}
+    current = _current_object_name(trace_dir)
+    if current is None:
+        return out
+    candidates: list[Path] = []
+    loose_bytes = 0
+    for path in sorted(trace_dir.iterdir()):
+        if path.name == current or _member_name(path.name) is None or not path.is_file():
+            continue
+        try:
+            loose_bytes += path.stat().st_size
+        except FileNotFoundError:
+            continue
+        candidates.append(path)
+    if len(candidates) < min_loose and loose_bytes < min_bytes:
+        return out
+    loose: list[tuple[Path, PackMember]] = []
+    for path in candidates:
+        try:
+            loose.append((path, _loose_member(path)))
+        except FileNotFoundError:
+            continue
+    if not loose:
+        return out
+    members = sorted((m for _p, m in loose), key=lambda m: (m.mtime_ns, m.name))
+    expected = {(m.name, m.sha256) for m in members}
+    segment = _new_segment_path(trace_dir)
+    written = _write_pack(
+        segment, _unique(iter(members)), window_log(max(len(m.data) for m in members)), expected=expected
+    )
+    out["segment_written"] = True
+    out["segment_bytes"] = segment.stat().st_size
+    for path, member in loose:
+        if (member.name, member.sha256) not in written:
+            raise PackError(f"{trace_dir}: {member.name} missing from segment after write")
+        if path.name == member.name and _current_object_name(trace_dir) == member.name:
+            continue
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            continue
+        out["records_packed"] += 1
+    _fsync_dir(trace_dir)
     return out
 
 
@@ -415,7 +564,8 @@ def pack_superseded_trace_records(
     records_before, bytes_before = _tree_bytes(root)
     totals: dict[str, int] = dict.fromkeys(
         ("records_packable", "records_packed", "skipped_current", "skipped_young",
-         "loose_bytes_packable", "pack_bytes", "tmp_removed", "pack_written"),
+         "loose_bytes_packable", "pack_bytes", "tmp_removed", "pack_written",
+         "segments_merged"),
         0,
     )
     errors: list[dict[str, str]] = []
@@ -455,14 +605,14 @@ def unpack_trace_dir(trace_dir: Path, *, dry_run: bool = False) -> dict[str, int
     """Restore every packed object of one trace as a loose file, byte-exact."""
 
     out = {"records_restored": 0, "records_present": 0, "packs_removed": 0}
-    pack = pack_path(trace_dir)
-    if not pack.is_file():
+    packs = trace_packs(trace_dir)
+    if not packs:
         return out
-    members = list(iter_pack_members(pack))
+    members = list(_iter_all_members(packs))
     newest: dict[str, PackMember] = {}
     for member in members:
         if _sha256(member.data) != member.sha256:
-            raise PackError(f"{pack}: member {member.name} sha mismatch")
+            raise PackError(f"{trace_dir}: packed member {member.name} sha mismatch")
         if member.name not in newest or member.mtime_ns >= newest[member.name].mtime_ns:
             newest[member.name] = member
     for member in members:
@@ -488,9 +638,10 @@ def unpack_trace_dir(trace_dir: Path, *, dry_run: bool = False) -> dict[str, int
         os.replace(tmp_name, target)
     if not dry_run:
         _fsync_dir(trace_dir)
-        pack.unlink()
+        for pack in packs:
+            pack.unlink()
+            out["packs_removed"] += 1
         _fsync_dir(trace_dir)
-        out["packs_removed"] = 1
     return out
 
 
@@ -576,7 +727,10 @@ def all_packs() -> list[Path]:
     root = trace_records_root()
     if not root.exists():
         return []
-    return sorted(root.glob(f"*/*/{PACK_NAME}"))
+    return sorted(
+        [*root.glob(f"*/*/{PACK_NAME}"),
+         *(p for p in root.glob(f"*/*/{SEGMENT_GLOB}") if _SEGMENT_NAME.match(p.name))]
+    )
 
 
 def _rel(path: Path) -> str:

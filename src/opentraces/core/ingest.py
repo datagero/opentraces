@@ -708,6 +708,7 @@ def ingest_one_session(
     parser_name: str | None = None,
     reconcile_watcher: bool = True,
     trace_record_only: bool = False,
+    min_recapture_interval_s: float = 0,
 ) -> IngestResult:
     """Ingest a single registered-agent session JSONL into the project's inbox.
 
@@ -718,6 +719,13 @@ def ingest_one_session(
     ``reparse=True`` forces a re-derivation even if the file hasn't
     grown. Used by the ``_scan --reparse`` CLI path and by the schema-
     bump auto-upgrade (Phase 3) — not by the default watcher tick.
+
+    ``min_recapture_interval_s > 0`` defers an in-place refresh of a trace
+    whose record was written less than that many seconds ago (action
+    ``skipped``, error ``deferred: ...``). The observed bookmark is NOT
+    advanced, so the next watcher sweep still sees the growth and captures
+    it. Only the Stop-hook path passes it; new traces, new generations and
+    ``reparse`` are never deferred.
     """
     resolved_parser_name = parser_name or "claude-code"
     session_id = _session_id_from(jsonl_path, resolved_parser_name)
@@ -744,7 +752,8 @@ def ingest_one_session(
                                   reparse=reparse, cfg=resolved_cfg,
                                   parser_name=resolved_parser_name,
                                   reconcile_watcher=reconcile_watcher,
-                                  trace_record_only=trace_record_only)
+                                  trace_record_only=trace_record_only,
+                                  min_recapture_interval_s=min_recapture_interval_s)
     except _LockHeld:
         # Another ingest already owns this session; it (or the watcher
         # sweep) will cover the work. Skip rather than stack behind it.
@@ -761,6 +770,20 @@ def ingest_one_session(
         )
 
 
+def _record_age_seconds(project_dir: Path, trace_id: str) -> float | None:
+    """Seconds since ``trace_id``'s current record pointer was written, if any."""
+
+    import time
+
+    from .bucket_trace_records import trace_record_path
+
+    try:
+        mtime = trace_record_path(get_project_dir(project_dir).name, trace_id).stat().st_mtime
+    except OSError:
+        return None
+    return max(0.0, time.time() - mtime)
+
+
 def _ingest_locked(
     jsonl_path: Path,
     project_dir: Path,
@@ -771,6 +794,7 @@ def _ingest_locked(
     parser_name: str,
     reconcile_watcher: bool,
     trace_record_only: bool,
+    min_recapture_interval_s: float = 0,
 ) -> IngestResult:
     """Inner, flock-held ingest. Must not raise; caller wraps."""
 
@@ -833,6 +857,14 @@ def _ingest_locked(
             # record's identity is stable across re-ingest.
             next_generation = latest_gen.generation
             trace_id = latest_gen.trace_id
+            if min_recapture_interval_s > 0 and not reparse:
+                age = _record_age_seconds(project_dir, trace_id)
+                if age is not None and age < min_recapture_interval_s:
+                    return IngestResult(
+                        session_id=session_id, action="skipped", trace_id=trace_id,
+                        error=f"deferred: re-captured {int(age)}s ago "
+                              f"(min interval {int(min_recapture_interval_s)}s)",
+                    )
 
     # Parse. The parser returns None if the quality gate filters out the
     # session (no meaningful content yet). We treat that as a clean skip
