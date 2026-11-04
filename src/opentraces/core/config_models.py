@@ -198,6 +198,11 @@ class CaptureConfig(BaseModel):
 
     otlp: CaptureOTLPConfig = Field(default_factory=CaptureOTLPConfig)
     tracking_mode: Literal["global", "manual"] = "global"
+    # Stop-hook re-capture throttle (seconds). A still-growing session is
+    # re-captured by the hook at most once per interval; the watcher sweep
+    # (default every 300 s) picks up anything deferred. 0 = every turn.
+    # Env OPENTRACES_HOOK_MIN_INTERVAL_S overrides.
+    hook_min_interval_seconds: int = Field(300, ge=0)
 
     model_config = {"extra": "ignore"}
 
