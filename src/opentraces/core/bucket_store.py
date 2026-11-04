@@ -44,6 +44,12 @@ from ..security.privacy import (
     record_privacy_tier,
 )
 from . import paths
+from .bucket_archive import (
+    archive_root,
+    has_live_archive_entries,
+    is_archived,
+    skip_if_archived,
+)
 from .bucket_layout import (
     _digest_hex,
     _path_part,
@@ -660,6 +666,11 @@ def bucket_manifest(
     # Retain ``digest`` as a compat alias for callers that still consume the
     # v1 field name (bucket_remote, datasets).
     manifest["digest"] = bucket_digest
+    if write and has_live_archive_entries() and archive_root() is None:
+        # Archived units are listed from the archive; with it offline the sweep
+        # would drop their rows and shift the digest, so leave the persisted
+        # manifest alone rather than write a degraded one.
+        write = False
     if write:
         # Write-only-on-change discipline (matches bucket_repair §5): persist
         # manifest.json only when the content differs from the on-disk
@@ -817,6 +828,9 @@ def upsert_manifest_trace_row(
     is unchanged because both paths derive it from the same envelope.
     """
 
+    if skip_if_archived(project_slug, trace_id):
+        return None
+
     # Plan 087 — source the row's digest-excluded ``status`` block from the
     # authoritative trace-record OBJECT envelope (the same source every other
     # row-producing path uses), so an upsert-maintained row matches a full
@@ -918,7 +932,9 @@ def _digest_safe_trace_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     field is already status-free (``status`` is not in ``digest_material``).
     """
 
-    return [{k: v for k, v in row.items() if k != "status"} for row in rows]
+    return [
+        {k: v for k, v in row.items() if k not in {"status", "archived"}} for row in rows
+    ]
 
 
 _MACHINE_LOCAL_DIGEST_KEYS = frozenset({"root", "repo_path"})
@@ -1215,6 +1231,9 @@ def sync_trace_records_from_local_stores(
     expected_paths: set[Path] = set()
     cfg = None
     for record, project_slug, source_layer in _iter_legacy_trace_records():
+        if skip_if_archived(project_slug, record.trace_id):
+            unchanged += 1
+            continue
         explicit_tier = record_privacy_tier(record)
         if _needs_legacy_security_refresh(record) and explicit_tier != "off":
             if cfg is None:
@@ -1253,6 +1272,8 @@ def sync_trace_records_from_local_stores(
     if prune and root.exists():
         for obj in iter_trace_record_objects():
             if obj.path in expected_paths:
+                continue
+            if is_archived(obj.project_slug, obj.trace_id):
                 continue
             if obj.envelope.get("legacy_mirror") is True:
                 try:

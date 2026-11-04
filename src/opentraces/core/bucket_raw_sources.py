@@ -9,6 +9,7 @@ from typing import Any
 from opentraces.core._time import utc_now_str
 
 from . import paths
+from .bucket_archive import glob_with_archive, resolve_read, skip_if_archived
 from ._bucket_io import (
     _atomic_write_bytes,
     _atomic_write_json,
@@ -30,6 +31,12 @@ def write_raw_source_artifact(
 ) -> dict[str, Any]:
     """Store an optional raw source artifact in the portable bucket."""
 
+    if skip_if_archived(project_slug, trace_id):
+        link_path = raw_sources_root() / "sources" / _path_part(project_slug) / f"{_path_part(trace_id)}.json"
+        try:
+            return json.loads(resolve_read(link_path).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
     data = source_path.read_bytes()
     digest = _digest_bytes(data)
     digest_hex = _digest_hex(digest)
@@ -80,28 +87,27 @@ def raw_source_snapshot(*, include_objects: bool = False) -> dict[str, Any]:
     root = raw_sources_root()
     sources: list[dict[str, Any]] = []
     sources_root = root / "sources"
-    if sources_root.exists():
-        for path in sorted(sources_root.glob("*/*.json")):
-            try:
-                item = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError, json.JSONDecodeError):
-                continue
-            if item.get("schema_version") != RAW_SOURCE_SCHEMA:
-                continue
-            sources.append(
-                {
-                    "path": path.relative_to(root).as_posix(),
-                    "project_slug": item.get("project_slug"),
-                    "trace_id": item.get("trace_id"),
-                    "source_kind": item.get("source_kind"),
-                    "parser": item.get("parser"),
-                    "content_digest": item.get("content_digest"),
-                    "content_length": item.get("content_length"),
-                    "remote_syncable": bool((item.get("remote_sync") or {}).get("eligible")),
-                    "written_at": item.get("written_at"),
-                    **({"object": item} if include_objects else {}),
-                }
-            )
+    for path in glob_with_archive(sources_root, "*/*.json"):
+        try:
+            item = json.loads(resolve_read(path).read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        if item.get("schema_version") != RAW_SOURCE_SCHEMA:
+            continue
+        sources.append(
+            {
+                "path": path.relative_to(root).as_posix(),
+                "project_slug": item.get("project_slug"),
+                "trace_id": item.get("trace_id"),
+                "source_kind": item.get("source_kind"),
+                "parser": item.get("parser"),
+                "content_digest": item.get("content_digest"),
+                "content_length": item.get("content_length"),
+                "remote_syncable": bool((item.get("remote_sync") or {}).get("eligible")),
+                "written_at": item.get("written_at"),
+                **({"object": item} if include_objects else {}),
+            }
+        )
     digest_material = [
         (
             f"{item.get('path')} {item.get('content_digest')} "

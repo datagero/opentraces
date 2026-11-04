@@ -20,6 +20,7 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Sequence
 
+from ..bucket_archive import resolve_read
 from .contract import validate_capsule
 from .render import render_capsule_markdown, render_issue_body
 
@@ -293,7 +294,7 @@ def _read_companion_bytes(slug: str, trace_id: str) -> dict[str, bytes]:
     """
     result: dict[str, bytes] = {}
     for face, path_fn in _companion_faces():
-        raw_path = path_fn(slug, trace_id)
+        raw_path = resolve_read(path_fn(slug, trace_id))
         result[face] = raw_path.read_bytes() if raw_path.exists() else b""
     return result
 
@@ -417,7 +418,7 @@ def _build_mini_bucket_uncached(
             if trace_raw is not None:
                 raw = trace_raw.get(face, b"")
             else:
-                raw_path = path_fn(slug, tid)
+                raw_path = resolve_read(path_fn(slug, tid))
                 raw = raw_path.read_bytes() if raw_path.exists() else b""
             gz, redaction = redact_companions(raw, tools=tools)
             content = gzip.decompress(gz) if gz else b""

@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Iterator
 
 from . import paths
+from .bucket_archive import glob_with_archive, resolve_read
 
 # Layer identifiers, used both as a stable label and for tie-break priority.
 LAYER_BUCKET = "bucket"          # v2 object or plan-079 legacy mirror
@@ -90,7 +91,7 @@ def _beats(candidate: CorpusSource, current: CorpusSource) -> bool:
 
 def _safe_mtime_ns(path: Path) -> int | None:
     try:
-        return path.stat().st_mtime_ns
+        return resolve_read(path).stat().st_mtime_ns
     except OSError:
         return None
 
@@ -152,11 +153,10 @@ def _bucket_candidates_for(trace_id: str) -> list[CorpusSource]:
     objects: list[CorpusSource] = []
 
     root = bs.trace_records_root()
-    if root.exists():
-        for pointer_path in sorted(root.glob(f"*/{part}/current.json")):
-            source = _bucket_source_from_pointer_file(pointer_path, trace_id)
-            if source is not None:
-                objects.append(source)
+    for pointer_path in glob_with_archive(root, f"*/{part}/current.json"):
+        source = _bucket_source_from_pointer_file(pointer_path, trace_id)
+        if source is not None:
+            objects.append(source)
 
     object_projects = {source.project_slug for source in objects}
     mirrors: list[CorpusSource] = []
@@ -173,7 +173,7 @@ def _bucket_source_from_pointer_file(pointer_path: Path, trace_id: str) -> Corpu
     from . import bucket_store as bs
 
     try:
-        raw = json.loads(pointer_path.read_text(encoding="utf-8"))
+        raw = json.loads(resolve_read(pointer_path).read_text(encoding="utf-8"))
     except (OSError, ValueError, json.JSONDecodeError):
         return None
     if raw.get("schema_version") != bs.TRACE_RECORD_POINTER_SCHEMA:

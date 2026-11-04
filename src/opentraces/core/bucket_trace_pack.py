@@ -53,6 +53,7 @@ from pathlib import Path
 from typing import Any
 
 from . import paths
+from .bucket_archive import resolve_read
 from .bucket_layout import trace_records_root
 from .bucket_models import TRACE_RECORD_POINTER_SCHEMA
 from .bucket_pack_codecs import (
@@ -150,7 +151,7 @@ def list_pack(path: Path) -> set[tuple[str, str]]:
 def read_packed_object(object_path: Path) -> bytes | None:
     """Return the bytes of ``object_path`` from its trace's pack, if packed."""
 
-    pack = pack_path(object_path.parent)
+    pack = resolve_read(pack_path(object_path.parent))
     if not pack.is_file():
         return None
     found: PackMember | None = None

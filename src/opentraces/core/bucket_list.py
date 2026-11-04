@@ -129,7 +129,7 @@ def _project_row(row: dict[str, Any]) -> dict[str, Any]:
     else:
         sync_state = "cleared" if status.get("syncable") is True else "not_cleared"
         security_stale = bool(status.get("security_stale"))
-    return {
+    out = {
         "trace_id": row.get("trace_id"),
         "project_slug": row.get("project_slug"),
         "title": _truncate_title(row.get("title")),
@@ -138,6 +138,9 @@ def _project_row(row: dict[str, Any]) -> dict[str, Any]:
         "sync_state": sync_state,
         "security_stale": security_stale,
     }
+    if row.get("archived") is True:
+        out["archived"] = True
+    return out
 
 
 def _matches(

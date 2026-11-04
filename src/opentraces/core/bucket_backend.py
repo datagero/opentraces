@@ -42,6 +42,7 @@ try:  # pragma: no cover - exercised by tests through monkeypatching.
 except Exception:  # pragma: no cover
     hf_hub_download = None  # type: ignore[assignment]
 
+from .bucket_archive import resolve_read
 from .bucket_layout import (
     blobs_v1_context_path,
     blobs_v1_raw_path,
@@ -231,7 +232,7 @@ class LocalBucketBackend(BucketBackend):
     def get_trace_json(self, trace_id: str) -> dict[str, Any]:
         manifest = self.get_manifest()
         project_slug = self._project_slug_for_trace(manifest, trace_id)
-        path = trace_v1_json_path(project_slug, trace_id)
+        path = resolve_read(trace_v1_json_path(project_slug, trace_id))
         if not path.exists():
             raise BucketRemoteError(
                 f"trace.json missing for {trace_id!r} under {project_slug!r}: {path}"
@@ -246,17 +247,17 @@ class LocalBucketBackend(BucketBackend):
     def read_trail_jsonl_gz(self, trace_id: str) -> Iterator[dict[str, Any]]:
         manifest = self.get_manifest()
         project_slug = self._project_slug_for_trace(manifest, trace_id)
-        path = trace_v1_trail_path(project_slug, trace_id)
+        path = resolve_read(trace_v1_trail_path(project_slug, trace_id))
         yield from _iter_jsonl_gz_path(path)
 
     def read_context_jsonl_gz(self, trace_id: str) -> Iterator[dict[str, Any]]:
         manifest = self.get_manifest()
         project_slug = self._project_slug_for_trace(manifest, trace_id)
-        path = trace_v1_context_path(project_slug, trace_id)
+        path = resolve_read(trace_v1_context_path(project_slug, trace_id))
         yield from _iter_jsonl_gz_path(path)
 
     def get_layer_blob(self, layer_id: str, project_slug: str) -> dict[str, Any]:
-        path = blobs_v1_context_path(project_slug, layer_id)
+        path = resolve_read(blobs_v1_context_path(project_slug, layer_id))
         if not path.exists():
             raise BucketRemoteError(
                 f"context layer blob missing: layer_id={layer_id!r} project={project_slug!r}: {path}"
@@ -277,7 +278,7 @@ class LocalBucketBackend(BucketBackend):
     def get_raw_message_blob(
         self, content_hash: str, project_slug: str
     ) -> bytes | None:
-        path = blobs_v1_raw_path(project_slug, content_hash, suffix=".json.gz")
+        path = resolve_read(blobs_v1_raw_path(project_slug, content_hash, suffix=".json.gz"))
         if not path.exists():
             return None
         try:

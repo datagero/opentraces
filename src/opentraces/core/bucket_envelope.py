@@ -25,6 +25,13 @@ from ..security.privacy import (
     bucket_security_state,
 )
 from . import paths
+from .bucket_archive import (
+    exists_with_archive,
+    glob_with_archive,
+    is_archived,
+    resolve_read,
+    skip_if_archived,
+)
 from .bucket_layout import (
     _path_part,
     raw_sources_root,
@@ -459,6 +466,24 @@ def _rederive_patch_rows(
     return new_patches, n_anchored, n_deattributed
 
 
+def _archived_envelope_summary(project_slug: str, trace_id: str) -> dict[str, Any]:
+    """Summary returned when an archived unit's projection is left untouched."""
+
+    return {
+        "schema_version": BUCKET_PER_TRACE_SCHEMA,
+        "project_slug": project_slug,
+        "trace_id": trace_id,
+        "trace_path": trace_v1_json_path(project_slug, trace_id)
+        .relative_to(paths.bucket_dir())
+        .as_posix(),
+        "trail_event_count": 0,
+        "context_event_count": 0,
+        "has_trace_record": True,
+        "archived": True,
+        "projected_at": utc_now_str(),
+    }
+
+
 def _write_per_trace_envelope(
     project_slug: str,
     trace_id: str,
@@ -476,6 +501,8 @@ def _write_per_trace_envelope(
     same-bytes writers keep this idempotent.
     """
 
+    if skip_if_archived(project_slug, trace_id):
+        return _archived_envelope_summary(project_slug, trace_id)
     trace_dir = traces_v1_dir(project_slug, trace_id)
     trace_dir.mkdir(parents=True, exist_ok=True)
 
@@ -612,6 +639,9 @@ def project_per_trace_exports(
     """
 
     from .trails.event_log import read_events_for_trace
+
+    if skip_if_archived(project_slug, trace_id):
+        return _archived_envelope_summary(project_slug, trace_id)
 
     # 1. Filter events by trace_id (sequence order preserved). Prefer the live
     # Git event log; fall back to the bucket's own events mirror when there is
@@ -779,6 +809,13 @@ def _resolve_record_envelope(
     return None
 
 
+def _nonempty(path: Path) -> bool:
+    """Present (locally or via the archive fallback) with a non-zero size."""
+
+    real = resolve_read(path)
+    return real.exists() and real.stat().st_size > 0
+
+
 def _per_trace_v2_summary(
     project_slug: str,
     trace_id: str,
@@ -821,9 +858,9 @@ def _per_trace_v2_summary(
         has_context = True
         has_sources = True
     else:
-        has_trail = trail_path.exists() and trail_path.stat().st_size > 0
-        has_context = context_path.exists() and context_path.stat().st_size > 0
-        has_sources = sources_path.exists() and sources_path.stat().st_size > 0
+        has_trail = _nonempty(trail_path)
+        has_context = _nonempty(context_path)
+        has_sources = _nonempty(sources_path)
 
     # Summary counters from TraceRecord when available.
     step_count = 0
@@ -976,16 +1013,14 @@ def iter_traces_v2(
 
     root = traces_v1_root()
     rows: list[dict[str, Any]] = []
-    if not root.exists():
-        return rows
     glob_prefix = f"{_path_part(project_slug)}/*" if project_slug else "*/*"
-    for trace_json in sorted(root.glob(f"{glob_prefix}/trace.json")):
+    for trace_json in glob_with_archive(root, f"{glob_prefix}/trace.json"):
         proj_dir = trace_json.parent.parent
         proj_slug = unquote(proj_dir.name)
         tid = unquote(trace_json.parent.name)
         record: TraceRecord | None = None
         try:
-            raw = json.loads(trace_json.read_text(encoding="utf-8"))
+            raw = json.loads(resolve_read(trace_json).read_text(encoding="utf-8"))
             record = TraceRecord.model_validate(raw)
         except (OSError, ValueError, json.JSONDecodeError, ValidationError):
             record = None
@@ -996,16 +1031,17 @@ def iter_traces_v2(
             envelope = _resolve_record_envelope(proj_slug, tid, record)
         anchors_resolved = anchor_maps is not None and proj_slug in anchor_maps[1]
         distinct_anchored = anchor_maps[0].get(tid) if anchor_maps is not None else None
-        rows.append(
-            _per_trace_v2_summary(
-                proj_slug,
-                tid,
-                record,
-                record_envelope=envelope,
-                distinct_anchored=distinct_anchored,
-                anchors_resolved=anchors_resolved,
-            )
+        row = _per_trace_v2_summary(
+            proj_slug,
+            tid,
+            record,
+            record_envelope=envelope,
+            distinct_anchored=distinct_anchored,
+            anchors_resolved=anchors_resolved,
         )
+        if is_archived(proj_slug, tid):
+            row["archived"] = True
+        rows.append(row)
     rows.sort(key=lambda item: (item["project_slug"], item["trace_id"]))
     return rows
 
@@ -1023,13 +1059,11 @@ def trace_v2_summary_by_id(trace_id: str) -> dict[str, Any] | None:
     """
 
     root = traces_v1_root()
-    if not root.exists():
-        return None
-    for trace_json in sorted(root.glob(f"*/{_path_part(trace_id)}/trace.json")):
+    for trace_json in glob_with_archive(root, f"*/{_path_part(trace_id)}/trace.json"):
         proj_slug = unquote(trace_json.parent.parent.name)
         record: TraceRecord | None = None
         try:
-            raw = json.loads(trace_json.read_text(encoding="utf-8"))
+            raw = json.loads(resolve_read(trace_json).read_text(encoding="utf-8"))
             record = TraceRecord.model_validate(raw)
         except (OSError, ValueError, json.JSONDecodeError, ValidationError):
             record = None
@@ -1172,4 +1206,4 @@ def _is_legacy_read_in_place_mirror(project_slug: str, trace_id: str) -> bool:
     capture_link = (
         raw_sources_root() / "sources" / _path_part(project_slug) / f"{_path_part(trace_id)}.json"
     )
-    return not capture_link.exists()
+    return not exists_with_archive(capture_link)

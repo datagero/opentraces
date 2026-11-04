@@ -846,8 +846,14 @@ def bucket_rebuild_cmd(substrate: str, as_json: bool) -> None:
         "the live bucket."
     ),
 )
+@click.option(
+    "--rehydrate",
+    "rehydrate",
+    is_flag=True,
+    help="Also rebuild units that were archived off this machine (default: leave them archived).",
+)
 @click.option("--json", "as_json", is_flag=True, help="Emit structured JSON.")
-def bucket_repair_cmd(bucket_root: Path | None, as_json: bool) -> None:
+def bucket_repair_cmd(bucket_root: Path | None, rehydrate: bool, as_json: bool) -> None:
     """Re-project the full bucket from canonical (event log + blob store).
 
     Per plan 080 §20 Resolution G, ``bucket repair`` is the documented
@@ -873,8 +879,14 @@ def bucket_repair_cmd(bucket_root: Path | None, as_json: bool) -> None:
             f"Phase B Track B1 stub: bucket_repair not yet implemented ({exc})"
         ) from exc
 
+    from ..core.bucket_archive import allow_rehydrate
+
     try:
-        result = bucket_repair(bucket_root=bucket_root)
+        if rehydrate:
+            with allow_rehydrate():
+                result = bucket_repair(bucket_root=bucket_root)
+        else:
+            result = bucket_repair(bucket_root=bucket_root)
     except NotImplementedError as exc:
         raise click.ClickException(
             f"Phase B Track B1 stub: bucket_repair not yet implemented ({exc})"
@@ -1294,7 +1306,10 @@ def bucket_connect_cmd(
     )
 
 
+from .bucket_archive import bucket_archive_cmd, bucket_rehydrate_cmd
 from .bucket_pack import bucket_pack_cmd, bucket_unpack_cmd
 
+bucket_group.add_command(bucket_archive_cmd)
+bucket_group.add_command(bucket_rehydrate_cmd)
 bucket_group.add_command(bucket_pack_cmd)
 bucket_group.add_command(bucket_unpack_cmd)

@@ -20,6 +20,12 @@ from pydantic import ValidationError
 from ..security.privacy import bucket_security_state
 from . import paths
 from ._bucket_io import _atomic_write_json, _digest_payload
+from .bucket_archive import (
+    exists_with_archive,
+    glob_with_archive,
+    resolve_read,
+    skip_if_archived,
+)
 from .bucket_layout import (
     _digest_hex,
     _path_part,
@@ -75,6 +81,7 @@ def write_trace_record(
     security_state = bucket_security_state(normalized, privacy_tier=privacy_tier)
     object_path = trace_record_object_path(project_slug, normalized.trace_id, record_hash)
     relative_object_path = object_path.relative_to(paths.bucket_dir()).as_posix()
+    archived_skip = skip_if_archived(project_slug, normalized.trace_id)
     envelope = {
         "schema_version": TRACE_RECORD_BUCKET_SCHEMA,
         "project_slug": project_slug,
@@ -86,6 +93,16 @@ def write_trace_record(
         "written_at": utc_now_str(),
         "record": record_payload,
     }
+    if archived_skip:
+        return BucketTraceRecord(
+            path=object_path,
+            project_slug=project_slug,
+            source_layer=source_layer,
+            trace_id=normalized.trace_id,
+            record_hash=record_hash,
+            record=normalized,
+            envelope=envelope,
+        )
     _atomic_write_json(object_path, envelope)
     _atomic_write_json(
         trace_record_path(project_slug, normalized.trace_id),
@@ -162,12 +179,11 @@ def iter_trace_record_objects(
     seen: set[tuple[str, str]] = set()
     root = trace_records_root()
     glob_prefix = f"{_path_part(project_slug)}/*" if project_slug else "*/*"
-    if root.exists():
-        for path in sorted(root.glob(f"{glob_prefix}/current.json")):
-            obj = read_trace_record_object(path)
-            if obj is not None:
-                seen.add((obj.project_slug, obj.trace_id))
-                out.append(obj)
+    for path in glob_with_archive(root, f"{glob_prefix}/current.json"):
+        obj = read_trace_record_object(path)
+        if obj is not None:
+            seen.add((obj.project_slug, obj.trace_id))
+            out.append(obj)
     legacy_root = legacy_trace_records_root()
     if legacy_root.exists():
         for path in sorted(legacy_root.glob(f"{glob_prefix}.json")):
@@ -284,41 +300,40 @@ def iter_trace_record_pointers(
     seen: set[tuple[str, str]] = set()
     root = trace_records_root()
     glob_prefix = f"{_path_part(project_slug)}/*" if project_slug else "*/*"
-    if root.exists():
-        for path in sorted(root.glob(f"{glob_prefix}/current.json")):
-            try:
-                raw = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError, json.JSONDecodeError):
-                continue
-            if raw.get("schema_version") != TRACE_RECORD_POINTER_SCHEMA:
-                continue
-            object_path = raw.get("object_path")
-            trace_id = str(raw.get("trace_id") or "")
-            project = str(raw.get("project_slug") or "")
-            source_layer = str(raw.get("source_layer") or "")
-            record_hash = str(raw.get("record_hash") or "")
-            if (
-                not isinstance(object_path, str)
-                or not object_path
-                or not trace_id
-                or not project
-                or not source_layer
-                or not record_hash
-            ):
-                continue
-            resolved = paths.bucket_dir() / object_path
-            if not resolved.exists():
-                continue
-            seen.add((project, trace_id))
-            out.append(
-                BucketTraceRecordPointer(
-                    path=resolved,
-                    project_slug=project,
-                    source_layer=source_layer,
-                    trace_id=trace_id,
-                    record_hash=record_hash,
-                )
+    for path in glob_with_archive(root, f"{glob_prefix}/current.json"):
+        try:
+            raw = json.loads(resolve_read(path).read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        if raw.get("schema_version") != TRACE_RECORD_POINTER_SCHEMA:
+            continue
+        object_path = raw.get("object_path")
+        trace_id = str(raw.get("trace_id") or "")
+        project = str(raw.get("project_slug") or "")
+        source_layer = str(raw.get("source_layer") or "")
+        record_hash = str(raw.get("record_hash") or "")
+        if (
+            not isinstance(object_path, str)
+            or not object_path
+            or not trace_id
+            or not project
+            or not source_layer
+            or not record_hash
+        ):
+            continue
+        resolved = paths.bucket_dir() / object_path
+        if not exists_with_archive(resolved):
+            continue
+        seen.add((project, trace_id))
+        out.append(
+            BucketTraceRecordPointer(
+                path=resolved,
+                project_slug=project,
+                source_layer=source_layer,
+                trace_id=trace_id,
+                record_hash=record_hash,
             )
+        )
 
     legacy_root = legacy_trace_records_root()
     if legacy_root.exists():
@@ -421,7 +436,7 @@ def _resolve_trace_record_pointer(path: Path) -> Path:
     if path.name != "current.json":
         return path
     try:
-        pointer = json.loads(path.read_text(encoding="utf-8"))
+        pointer = json.loads(resolve_read(path).read_text(encoding="utf-8"))
     except (OSError, ValueError, json.JSONDecodeError):
         return path
     if pointer.get("schema_version") != TRACE_RECORD_POINTER_SCHEMA:
@@ -440,7 +455,7 @@ def _read_object_text(path: Path) -> str:
     """
 
     try:
-        return path.read_text(encoding="utf-8")
+        return resolve_read(path).read_text(encoding="utf-8")
     except FileNotFoundError:
         from .bucket_trace_pack import read_packed_object
 

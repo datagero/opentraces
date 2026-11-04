@@ -27,6 +27,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from ..bucket_archive import resolve_read
 from ..bucket_layout import trace_v1_trail_path
 from ..trails.models import TrailEvent
 from ..trails.query import (
@@ -95,7 +96,7 @@ def _read_trail_companion(slug: str, trace_id: str) -> list[TrailEvent] | None:
     the projection ignores anyway (e.g. a corrupt ``filesystem_mutation_observed``
     row) cannot hide a dropped anchor, so it is not validated.
     """
-    path = trace_v1_trail_path(slug, trace_id)
+    path = resolve_read(trace_v1_trail_path(slug, trace_id))
     if not path.exists():
         return None
     events: list[TrailEvent] = []
